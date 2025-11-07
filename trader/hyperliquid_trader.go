@@ -2,10 +2,12 @@ package trader
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/sonirico/go-hyperliquid"
@@ -17,11 +19,14 @@ type HyperliquidTrader struct {
 	ctx           context.Context
 	walletAddr    string
 	meta          *hyperliquid.Meta // 缓存meta信息（包含精度等）
-	isCrossMargin bool             // 是否为全仓模式
+	isCrossMargin bool              // 是否为全仓模式
 }
 
 // NewHyperliquidTrader 创建Hyperliquid交易器
 func NewHyperliquidTrader(privateKeyHex string, walletAddr string, testnet bool) (*HyperliquidTrader, error) {
+	// 去掉私钥的 0x 前缀（如果有，不区分大小写）
+	privateKeyHex = strings.TrimPrefix(strings.ToLower(privateKeyHex), "0x")
+
 	// 解析私钥
 	privateKey, err := crypto.HexToECDSA(privateKeyHex)
 	if err != nil {
@@ -34,13 +39,18 @@ func NewHyperliquidTrader(privateKeyHex string, walletAddr string, testnet bool)
 		apiURL = hyperliquid.TestnetAPIURL
 	}
 
-	// // 从私钥生成钱包地址
-	// pubKey := privateKey.Public()
-	// publicKeyECDSA, ok := pubKey.(*ecdsa.PublicKey)
-	// if !ok {
-	// 	return nil, fmt.Errorf("无法转换公钥")
-	// }
-	// walletAddr := crypto.PubkeyToAddress(*publicKeyECDSA).Hex()
+	// 从私钥生成钱包地址（如果未提供）
+	if walletAddr == "" {
+		pubKey := privateKey.Public()
+		publicKeyECDSA, ok := pubKey.(*ecdsa.PublicKey)
+		if !ok {
+			return nil, fmt.Errorf("无法转换公钥")
+		}
+		walletAddr = crypto.PubkeyToAddress(*publicKeyECDSA).Hex()
+		log.Printf("✓ 从私钥自动生成钱包地址: %s", walletAddr)
+	} else {
+		log.Printf("✓ 使用提供的钱包地址: %s", walletAddr)
+	}
 
 	ctx := context.Background()
 
@@ -76,23 +86,54 @@ func NewHyperliquidTrader(privateKeyHex string, walletAddr string, testnet bool)
 func (t *HyperliquidTrader) GetBalance() (map[string]interface{}, error) {
 	log.Printf("🔄 正在调用Hyperliquid API获取账户余额...")
 
-	// 获取账户状态
+	// ✅ Step 1: 查询 Spot 现货账户余额
+	spotState, err := t.exchange.Info().SpotUserState(t.ctx, t.walletAddr)
+	var spotUSDCBalance float64 = 0.0
+	if err != nil {
+		log.Printf("⚠️ 查询 Spot 余额失败（可能无现货资产）: %v", err)
+	} else if spotState != nil && len(spotState.Balances) > 0 {
+		for _, balance := range spotState.Balances {
+			if balance.Coin == "USDC" {
+				spotUSDCBalance, _ = strconv.ParseFloat(balance.Total, 64)
+				log.Printf("✓ 发现 Spot 现货余额: %.2f USDC", spotUSDCBalance)
+				break
+			}
+		}
+	}
+
+	// ✅ Step 2: 查询 Perpetuals 合约账户状态
 	accountState, err := t.exchange.Info().UserState(t.ctx, t.walletAddr)
 	if err != nil {
-		log.Printf("❌ Hyperliquid API调用失败: %v", err)
+		log.Printf("❌ Hyperliquid Perpetuals API调用失败: %v", err)
 		return nil, fmt.Errorf("获取账户信息失败: %w", err)
 	}
 
 	// 解析余额信息（MarginSummary字段都是string）
 	result := make(map[string]interface{})
 
-	// 🔍 调试：打印API返回的完整CrossMarginSummary结构
-	summaryJSON, _ := json.MarshalIndent(accountState.MarginSummary, "  ", "  ")
-	log.Printf("🔍 [DEBUG] Hyperliquid API CrossMarginSummary完整数据:")
-	log.Printf("%s", string(summaryJSON))
+	// ✅ Step 3: 根据保证金模式动态选择正确的摘要（CrossMarginSummary 或 MarginSummary）
+	var accountValue, totalMarginUsed float64
+	var summaryType string
+	var summary interface{}
 
-	accountValue, _ := strconv.ParseFloat(accountState.MarginSummary.AccountValue, 64)
-	totalMarginUsed, _ := strconv.ParseFloat(accountState.MarginSummary.TotalMarginUsed, 64)
+	if t.isCrossMargin {
+		// 全仓模式：使用 CrossMarginSummary
+		accountValue, _ = strconv.ParseFloat(accountState.CrossMarginSummary.AccountValue, 64)
+		totalMarginUsed, _ = strconv.ParseFloat(accountState.CrossMarginSummary.TotalMarginUsed, 64)
+		summaryType = "CrossMarginSummary (全仓)"
+		summary = accountState.CrossMarginSummary
+	} else {
+		// 逐仓模式：使用 MarginSummary
+		accountValue, _ = strconv.ParseFloat(accountState.MarginSummary.AccountValue, 64)
+		totalMarginUsed, _ = strconv.ParseFloat(accountState.MarginSummary.TotalMarginUsed, 64)
+		summaryType = "MarginSummary (逐仓)"
+		summary = accountState.MarginSummary
+	}
+
+	// 🔍 调试：打印API返回的完整摘要结构
+	summaryJSON, _ := json.MarshalIndent(summary, "  ", "  ")
+	log.Printf("🔍 [DEBUG] Hyperliquid API %s 完整数据:", summaryType)
+	log.Printf("%s", string(summaryJSON))
 
 	// ⚠️ 关键修复：从所有持仓中累加真正的未实现盈亏
 	totalUnrealizedPnl := 0.0
@@ -109,16 +150,47 @@ func (t *HyperliquidTrader) GetBalance() (map[string]interface{}, error) {
 	// 需要返回"不包含未实现盈亏的钱包余额"
 	walletBalanceWithoutUnrealized := accountValue - totalUnrealizedPnl
 
-	result["totalWalletBalance"] = walletBalanceWithoutUnrealized // 钱包余额（不含未实现盈亏）
-	result["availableBalance"] = accountValue - totalMarginUsed   // 可用余额（总净值 - 占用保证金）
-	result["totalUnrealizedProfit"] = totalUnrealizedPnl          // 未实现盈亏
+	// ✅ Step 4: 使用 Withdrawable 欄位（PR #443）
+	// Withdrawable 是官方提供的真实可提现余额，比简单计算更可靠
+	availableBalance := 0.0
+	if accountState.Withdrawable != "" {
+		withdrawable, err := strconv.ParseFloat(accountState.Withdrawable, 64)
+		if err == nil && withdrawable > 0 {
+			availableBalance = withdrawable
+			log.Printf("✓ 使用 Withdrawable 作为可用余额: %.2f", availableBalance)
+		}
+	}
 
-	log.Printf("✓ Hyperliquid 账户: 总净值=%.2f (钱包%.2f+未实现%.2f), 可用=%.2f, 保证金占用=%.2f",
+	// 降级方案：如果没有 Withdrawable，使用简单计算
+	if availableBalance == 0 && accountState.Withdrawable == "" {
+		availableBalance = accountValue - totalMarginUsed
+		if availableBalance < 0 {
+			log.Printf("⚠️ 计算出的可用余额为负数 (%.2f)，重置为 0", availableBalance)
+			availableBalance = 0
+		}
+	}
+
+	// ✅ Step 5: 正确处理 Spot + Perpetuals 余额
+	// 重要：Spot 只加到总资产，不加到可用余额
+	//      原因：Spot 和 Perpetuals 是独立帐户，需手动 ClassTransfer 才能转账
+	totalWalletBalance := walletBalanceWithoutUnrealized + spotUSDCBalance
+
+	result["totalWalletBalance"] = totalWalletBalance    // 总资产（Perp + Spot）
+	result["availableBalance"] = availableBalance        // 可用余额（仅 Perpetuals，不含 Spot）
+	result["totalUnrealizedProfit"] = totalUnrealizedPnl // 未实现盈亏（仅来自 Perpetuals）
+	result["spotBalance"] = spotUSDCBalance              // Spot 现货余额（单独返回）
+
+	log.Printf("✓ Hyperliquid 完整账户:")
+	log.Printf("  • Spot 现货余额: %.2f USDC （需手动转账到 Perpetuals 才能开仓）", spotUSDCBalance)
+	log.Printf("  • Perpetuals 合约净值: %.2f USDC (钱包%.2f + 未实现%.2f)",
 		accountValue,
 		walletBalanceWithoutUnrealized,
-		totalUnrealizedPnl,
-		result["availableBalance"],
-		totalMarginUsed)
+		totalUnrealizedPnl)
+	log.Printf("  • Perpetuals 可用余额: %.2f USDC （可直接用于开仓）", availableBalance)
+	log.Printf("  • 保证金占用: %.2f USDC", totalMarginUsed)
+	log.Printf("  • 总资产 (Perp+Spot): %.2f USDC", totalWalletBalance)
+	log.Printf("  ⭐ 总资产: %.2f USDC | Perp 可用: %.2f USDC | Spot 余额: %.2f USDC",
+		totalWalletBalance, availableBalance, spotUSDCBalance)
 
 	return result, nil
 }
@@ -477,6 +549,24 @@ func (t *HyperliquidTrader) CloseShort(symbol string, quantity float64) (map[str
 	return result, nil
 }
 
+// CancelStopOrders 取消该币种的止盈/止
+
+// CancelStopLossOrders 仅取消止损单（Hyperliquid 暂无法区分止损和止盈，取消所有）
+func (t *HyperliquidTrader) CancelStopLossOrders(symbol string) error {
+	// Hyperliquid SDK 的 OpenOrder 结构不暴露 trigger 字段
+	// 无法区分止损和止盈单，因此取消该币种的所有挂单
+	log.Printf("  ⚠️ Hyperliquid 无法区分止损/止盈单，将取消所有挂单")
+	return t.CancelStopOrders(symbol)
+}
+
+// CancelTakeProfitOrders 仅取消止盈单（Hyperliquid 暂无法区分止损和止盈，取消所有）
+func (t *HyperliquidTrader) CancelTakeProfitOrders(symbol string) error {
+	// Hyperliquid SDK 的 OpenOrder 结构不暴露 trigger 字段
+	// 无法区分止损和止盈单，因此取消该币种的所有挂单
+	log.Printf("  ⚠️ Hyperliquid 无法区分止损/止盈单，将取消所有挂单")
+	return t.CancelStopOrders(symbol)
+}
+
 // CancelAllOrders 取消该币种的所有挂单
 func (t *HyperliquidTrader) CancelAllOrders(symbol string) error {
 	coin := convertSymbolToHyperliquid(symbol)
@@ -498,6 +588,40 @@ func (t *HyperliquidTrader) CancelAllOrders(symbol string) error {
 	}
 
 	log.Printf("  ✓ 已取消 %s 的所有挂单", symbol)
+	return nil
+}
+
+// CancelStopOrders 取消该币种的止盈/止损单（用于调整止盈止损位置）
+func (t *HyperliquidTrader) CancelStopOrders(symbol string) error {
+	coin := convertSymbolToHyperliquid(symbol)
+
+	// 获取所有挂单
+	openOrders, err := t.exchange.Info().OpenOrders(t.ctx, t.walletAddr)
+	if err != nil {
+		return fmt.Errorf("获取挂单失败: %w", err)
+	}
+
+	// 注意：Hyperliquid SDK 的 OpenOrder 结构不暴露 trigger 字段
+	// 因此暂时取消该币种的所有挂单（包括止盈止损单）
+	// 这是安全的，因为在设置新的止盈止损之前，应该清理所有旧订单
+	canceledCount := 0
+	for _, order := range openOrders {
+		if order.Coin == coin {
+			_, err := t.exchange.Cancel(t.ctx, coin, order.Oid)
+			if err != nil {
+				log.Printf("  ⚠ 取消订单失败 (oid=%d): %v", order.Oid, err)
+				continue
+			}
+			canceledCount++
+		}
+	}
+
+	if canceledCount == 0 {
+		log.Printf("  ℹ %s 没有挂单需要取消", symbol)
+	} else {
+		log.Printf("  ✓ 已取消 %s 的 %d 个挂单（包括止盈/止损单）", symbol, canceledCount)
+	}
+
 	return nil
 }
 

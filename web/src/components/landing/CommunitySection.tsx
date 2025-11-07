@@ -1,24 +1,42 @@
 import { motion } from 'framer-motion'
 import AnimatedSection from './AnimatedSection'
 
-function TestimonialCard({ quote, author, delay }: any) {
+interface CardProps {
+  quote: string
+  authorName: string
+  handle: string
+  avatarUrl: string
+  tweetUrl: string
+  delay: number
+}
+
+function TestimonialCard({ quote, authorName, delay }: CardProps) {
   return (
     <motion.div
-      className='p-6 rounded-xl'
-      style={{ background: 'var(--brand-dark-gray)', border: '1px solid rgba(240, 185, 11, 0.1)' }}
+      className="p-6 rounded-xl"
+      style={{
+        background: 'var(--brand-dark-gray)',
+        border: '1px solid rgba(240, 185, 11, 0.1)',
+      }}
       initial={{ opacity: 0, y: 20 }}
       whileInView={{ opacity: 1, y: 0 }}
       viewport={{ once: true }}
       transition={{ delay }}
       whileHover={{ scale: 1.05 }}
     >
-      <p className='text-lg mb-4' style={{ color: 'var(--brand-light-gray)' }}>
+      <p className="text-lg mb-4" style={{ color: 'var(--brand-light-gray)' }}>
         "{quote}"
       </p>
-      <div className='flex items-center gap-2'>
-        <div className='w-8 h-8 rounded-full' style={{ background: 'var(--binance-yellow)' }} />
-        <span className='text-sm font-semibold' style={{ color: 'var(--text-secondary)' }}>
-          {author}
+      <div className="flex items-center gap-2">
+        <div
+          className="w-8 h-8 rounded-full"
+          style={{ background: 'var(--binance-yellow)' }}
+        />
+        <span
+          className="text-sm font-semibold"
+          style={{ color: 'var(--text-secondary)' }}
+        >
+          {authorName}
         </span>
       </div>
     </motion.div>
@@ -26,7 +44,9 @@ function TestimonialCard({ quote, author, delay }: any) {
 }
 
 export default function CommunitySection() {
-  const staggerContainer = { animate: { transition: { staggerChildren: 0.1 } } }
+  const staggerContainer = {
+    animate: { transition: { staggerChildren: 0.1 } },
+  }
 
   // 推特内容整合（保持原三列布局，超出自动换行）
   const items: CardProps[] = [
@@ -65,12 +85,12 @@ export default function CommunitySection() {
 
   return (
     <AnimatedSection>
-      <div className='max-w-7xl mx-auto'>
+      <div className="max-w-7xl mx-auto">
         <motion.div
-          className='grid md:grid-cols-3 gap-6'
+          className="grid md:grid-cols-3 gap-6"
           variants={staggerContainer}
-          initial='initial'
-          whileInView='animate'
+          initial="initial"
+          whileInView="animate"
           viewport={{ once: true }}
         >
           {items.map((item, idx) => (
